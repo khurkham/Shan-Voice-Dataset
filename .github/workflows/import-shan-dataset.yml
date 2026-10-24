@@ -1,0 +1,168 @@
+
+name: Import Shan TTS Dataset
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-shan-dataset
+  cancel-in-progress: false
+
+jobs:
+  import-dataset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download dataset and fix transcription encoding
+        shell: python
+        run: |
+          import csv
+          import json
+          import time
+          import urllib.parse
+          import urllib.request
+          import wave
+          import io
+          import os
+
+          API = "https://datasets-server.huggingface.co/rows"
+          DATASET = "NorHsangPha/shn-tts-datasets"
+          OUT = "audio"
+          os.makedirs(OUT, exist_ok=True)
+
+          def get_json(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "Shan-Voice-Dataset-Importer"}
+              )
+              with urllib.request.urlopen(req, timeout=120) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          rows = []
+          for offset in (0, 100):
+              params = urllib.parse.urlencode({
+                  "dataset": DATASET,
+                  "config": "default",
+                  "split": "train",
+                  "offset": offset,
+                  "length": 100
+              })
+              result = get_json(f"{API}?{params}")
+              rows.extend(result.get("rows", []))
+
+          print(f"Dataset rows received: {len(rows)}")
+          if not rows:
+              raise RuntimeError("No dataset rows received")
+
+          manifest = []
+          report = []
+
+          for index, item in enumerate(rows, start=1):
+              row = item["row"]
+              row_id = int(item["row_idx"])
+              name = f"{row_id:04d}.wav"
+              path = os.path.join(OUT, name)
+
+              # Repair mojibake seen in the API response.
+              original = row["transcription"]
+              try:
+                  fixed = original.encode("latin-1").decode("utf-8")
+              except (UnicodeEncodeError, UnicodeDecodeError):
+                  fixed = original
+
+              audio_items = row.get("audio", [])
+              if not audio_items or not audio_items[0].get("src"):
+                  report.append({
+                      "row_idx": row_id,
+                      "audio_file": name,
+                      "status": "FAILED",
+                      "details": "Missing audio URL"
+                  })
+                  continue
+
+              url = audio_items[0]["src"]
+              status = "FAILED"
+              details = ""
+
+              for attempt in range(1, 4):
+                  try:
+                      req = urllib.request.Request(
+                          url, headers={"User-Agent": "Shan-Voice-Dataset-Importer"}
+                      )
+                      with urllib.request.urlopen(req, timeout=120) as response:
+                          audio_bytes = response.read()
+
+                      # Verify the WAV container before saving.
+                      with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
+                          frames = wav.getnframes()
+                          rate = wav.getframerate()
+                          if frames <= 0 or rate <= 0:
+                              raise ValueError("Empty or invalid WAV")
+                      with open(path, "wb") as f:
+                          f.write(audio_bytes)
+
+                      status = "DOWNLOADED"
+                      details = f"{len(audio_bytes)} bytes"
+                      break
+                  except Exception as exc:
+                      details = str(exc)
+                      time.sleep(attempt * 2)
+
+              report.append({
+                  "row_idx": row_id,
+                  "audio_file": name,
+                  "status": status,
+                  "details": details
+              })
+
+              if status == "DOWNLOADED":
+                  manifest.append({
+                      "row_idx": row_id,
+                      "audio_file": f"audio/{name}",
+                      "transcription": fixed,
+                      "audio_type": "audio/wav"
+                  })
+
+              print(f"[{index}/{len(rows)}] {name}: {status}")
+
+          with open("shan_dataset_fixed.csv", "w", newline="", encoding="utf-8-sig") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=[
+                      "row_idx", "audio_file", "transcription", "audio_type"
+                  ]
+              )
+              writer.writeheader()
+              writer.writerows(manifest)
+
+          with open("download_report.csv", "w", newline="", encoding="utf-8-sig") as f:
+              writer = csv.DictWriter(
+                  f,
+                  fieldnames=["row_idx", "audio_file", "status", "details"]
+              )
+              writer.writeheader()
+              writer.writerows(report)
+
+          successful = sum(r["status"] == "DOWNLOADED" for r in report)
+          print(f"Successful: {successful}/{len(rows)}")
+
+          if successful != len(rows):
+              raise RuntimeError(
+                  f"Some audio files failed: {len(rows) - successful}"
+              )
+
+      - name: Commit dataset to GitHub
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add audio shan_dataset_fixed.csv download_report.csv
+          git commit -m "Import Shan TTS dataset" || echo "No changes to commit"
+          git push
