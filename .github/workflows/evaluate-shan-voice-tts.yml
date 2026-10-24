@@ -1,0 +1,83 @@
+name: Evaluate Shan Voice TTS Quality
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample_count:
+        description: "How many dataset rows to test (10 for quick test, up to 184)"
+        required: true
+        default: "10"
+        type: choice
+        options:
+          - "10"
+          - "25"
+          - "50"
+          - "100"
+          - "184"
+      delay_seconds:
+        description: "Seconds between API requests (keep at 8 or more to respect rate limits)"
+        required: true
+        default: "8"
+        type: choice
+        options:
+          - "8"
+          - "10"
+          - "15"
+      speed:
+        description: "TTS speech speed"
+        required: true
+        default: "1.0"
+        type: choice
+        options:
+          - "0.8"
+          - "1.0"
+          - "1.2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evaluate-shan-voice-tts
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      TTS_API_URL: https://shan-voice.onrender.com
+      TTS_VOICE: shan-mms
+      TTS_SPEED: ${{ inputs.speed }}
+      SAMPLE_COUNT: ${{ inputs.sample_count }}
+      DELAY_SECONDS: ${{ inputs.delay_seconds }}
+      TTS_API_KEY: ${{ secrets.TTS_API_KEY }}
+
+    steps:
+      - name: Checkout dataset on GitHub-hosted runner
+        uses: actions/checkout@v4
+
+      - name: Check dataset manifest
+        run: |
+          python - <<'PY'
+          import csv
+          with open("shan_dataset_fixed.csv", encoding="utf-8-sig", newline="") as f:
+              rows = list(csv.DictReader(f))
+          print(f"Dataset manifest rows: {len(rows)}")
+          if len(rows) != 184:
+              raise SystemExit(f"Expected 184 dataset rows, found {len(rows)}")
+          print("Audio files are used only on the temporary GitHub runner, not downloaded to your PC.")
+          PY
+
+      - name: Evaluate TTS API
+        run: python scripts/evaluate_tts_quality.py
+
+      - name: Upload evaluation reports (7 days)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shan-voice-quality-report
+          path: |
+            tts_quality_report.csv
+            tts_quality_summary.json
+          if-no-files-found: warn
+          retention-days: 7
