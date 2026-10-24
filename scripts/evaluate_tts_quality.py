@@ -172,7 +172,7 @@ def main():
             }
             started_one = time.monotonic()
             try:
-                headers = {}
+                headers = {"Origin": BASE_URL}
                 if API_KEY:
                     headers["Authorization"] = "Bearer " + API_KEY
                 with request(
